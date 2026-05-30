@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import errno
 import json
 import logging
 import os
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +30,8 @@ from colorama import Fore, Style, init as colorama_init
 
 CONFIG_FILE = "audiobook_converter.ini"
 LOCK_FILE = "audiobook_converter.lock"
+EXTERNAL_PROCESS_LOCK = threading.Lock()
+ACTIVE_EXTERNAL_PROCESSES: set[subprocess.Popen[bytes]] = set()
 METADATA_KEYS = ("artist", "album_artist", "author", "composer", "title", "album")
 INVALID_FILENAME_CHARS = '<>:"/\\|?*\0'
 WINDOWS_RESERVED_NAMES = {
@@ -48,6 +54,14 @@ class LockError(Exception):
 
 class ProbeError(Exception):
     """Raised when ffprobe cannot read or describe a media file."""
+
+
+class DiskSpaceError(Exception):
+    """Raised when a file transaction detects disk-space exhaustion."""
+
+
+class ForcedTermination(Exception):
+    """Raised when the user requests immediate termination after a graceful quit."""
 
 
 @dataclass(frozen=True)
@@ -79,9 +93,15 @@ class AudioInfo:
 
     @property
     def bitrate_kbps(self) -> int:
-        """Return the bitrate rounded to the nearest whole kilobit per second."""
+        """Return the raw bitrate rounded to the nearest whole kilobit per second."""
 
         return round(self.bitrate_bps / 1000)
+
+    @property
+    def normalized_bitrate_kbps(self) -> int:
+        """Return the detected bitrate normalized to the nearest 8 kbps increment."""
+
+        return round(self.bitrate_kbps / 8) * 8
 
 
 @dataclass(frozen=True)
@@ -98,12 +118,19 @@ class ConversionPlan:
 
 @dataclass
 class ProcessingStats:
-    """Counters displayed in the final summary."""
+    """Counters displayed in progress updates and the final summary."""
 
     scanned: int = 0
+    processed: int = 0
     converted: int = 0
     skipped: int = 0
     failed: int = 0
+
+    @property
+    def remaining(self) -> int:
+        """Return the number of discovered files that have not reached a terminal state."""
+
+        return max(self.scanned - self.processed, 0)
 
 
 class ConfigManager:
@@ -206,6 +233,9 @@ class ConsoleDisplay:
     def error(self, message: str) -> None:
         self._write(message, Fore.RED, "error", stream=sys.stderr)
 
+    def critical(self, message: str) -> None:
+        self._write(message, Fore.RED + Style.BRIGHT, "error", stream=sys.stderr)
+
     def summary(self, message: str) -> None:
         self._write(message, Fore.WHITE + Style.BRIGHT, "summary")
 
@@ -254,18 +284,255 @@ class LockFile:
         self.release()
 
 
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Decoded subprocess result that is safe for unexpected byte sequences."""
+
+    args: list[str]
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def run_external_command(command: list[str]) -> CommandResult:
+    """Run an external command and decode captured output without UnicodeDecodeError.
+
+    FFmpeg and ffprobe sometimes emit bytes that are not valid UTF-8.  Capturing
+    bytes and decoding with replacement keeps a bad diagnostic line from ending
+    the whole batch.  POSIX children run in a separate session so the first
+    Ctrl+C can request a graceful quit without interrupting the active file
+    transaction.
+    """
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=(os.name != "nt"),
+    )
+    with EXTERNAL_PROCESS_LOCK:
+        ACTIVE_EXTERNAL_PROCESSES.add(process)
+    try:
+        stdout_bytes, stderr_bytes = process.communicate()
+    except BaseException:
+        terminate_external_process(process)
+        raise
+    finally:
+        with EXTERNAL_PROCESS_LOCK:
+            ACTIVE_EXTERNAL_PROCESSES.discard(process)
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+    return CommandResult(command, process.returncode, stdout_text, stderr_text)
+
+
+def terminate_external_process(process: subprocess.Popen[bytes]) -> None:
+    """Best-effort termination for an in-flight external command."""
+
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            logging.exception("Failed to kill external process: %s", process.args)
+
+
+def terminate_active_external_processes() -> None:
+    """Best-effort termination for all external commands known to be running."""
+
+    with EXTERNAL_PROCESS_LOCK:
+        processes = tuple(ACTIVE_EXTERNAL_PROCESSES)
+    for process in processes:
+        terminate_external_process(process)
+
+
+
+def is_disk_space_error(exc_or_message: BaseException | str) -> bool:
+    """Return True when an exception or command output indicates disk exhaustion."""
+
+    if isinstance(exc_or_message, OSError) and exc_or_message.errno == errno.ENOSPC:
+        return True
+
+    message = str(exc_or_message).casefold()
+    disk_space_markers = (
+        "no space left on device",
+        "disk full",
+        "not enough space",
+        "insufficient disk space",
+        "enospc",
+        "write error",
+    )
+    return any(marker in message for marker in disk_space_markers)
+
+
+class KeyboardController:
+    """Monitor q/p/Ctrl+C requests without interrupting active file transactions."""
+
+    def __init__(self) -> None:
+        self.pause_requested = False
+        self.quit_requested = False
+        self._stop_event = threading.Event()
+        self._prompt_event = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._previous_sigint_handler: Any = None
+        self._active_temp_files: set[Path] = set()
+
+    def start(self) -> None:
+        """Start daemon keyboard monitoring and install graceful Ctrl+C handling."""
+
+        self._previous_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle_sigint)
+        self._thread = threading.Thread(target=self._monitor_keyboard, name="keyboard-monitor", daemon=True)
+        self._thread.start()
+        logging.info("Keyboard controls enabled: q=quit, p=pause, Ctrl+C=graceful quit")
+
+    def stop(self) -> None:
+        """Stop monitoring and restore the previous Ctrl+C handler."""
+
+        self._stop_event.set()
+        if self._previous_sigint_handler is not None:
+            signal.signal(signal.SIGINT, self._previous_sigint_handler)
+
+    def request_pause(self) -> None:
+        with self._lock:
+            self.pause_requested = True
+        logging.info("Pause requested by keyboard input")
+
+    def request_quit(self, source: str) -> None:
+        with self._lock:
+            if self.quit_requested:
+                logging.critical("Forced termination requested by %s after graceful quit was already pending", source)
+                self.best_effort_cleanup()
+                if threading.current_thread() is threading.main_thread():
+                    raise ForcedTermination("Forced termination requested")
+                os.kill(os.getpid(), signal.SIGINT)
+                raise ForcedTermination("Forced termination requested")
+            self.quit_requested = True
+        logging.warning("Graceful quit requested by %s", source)
+
+    def clear_pause(self) -> None:
+        with self._lock:
+            self.pause_requested = False
+
+    def clear_quit(self) -> None:
+        with self._lock:
+            self.quit_requested = False
+
+    def register_temp_file(self, path: Path) -> None:
+        with self._lock:
+            self._active_temp_files.add(path)
+
+    def unregister_temp_file(self, path: Path) -> None:
+        with self._lock:
+            self._active_temp_files.discard(path)
+
+    def best_effort_cleanup(self) -> None:
+        """Attempt to remove currently known temporary outputs."""
+
+        terminate_active_external_processes()
+        with self._lock:
+            temp_files = tuple(self._active_temp_files)
+        for temp_file in temp_files:
+            try:
+                temp_file.unlink(missing_ok=True)
+                logging.info("Cleaned temporary file during forced termination: %s", temp_file)
+            except OSError:
+                logging.exception("Failed to clean temporary file during forced termination: %s", temp_file)
+
+    def prompt_section(self) -> "KeyboardPromptSection":
+        return KeyboardPromptSection(self)
+
+    def _handle_sigint(self, signum: int, frame: object) -> None:
+        del signum, frame
+        self.request_quit("Ctrl+C")
+
+    def _monitor_keyboard(self) -> None:
+        if os.name == "nt":
+            self._monitor_windows_keyboard()
+        else:
+            self._monitor_posix_keyboard()
+
+    def _handle_key(self, key: str) -> None:
+        if key.casefold() == "p":
+            self.request_pause()
+        elif key.casefold() == "q" or key == "\x03":
+            self.request_quit("keyboard" if key.casefold() == "q" else "Ctrl+C")
+
+    def _monitor_windows_keyboard(self) -> None:
+        try:
+            import msvcrt
+        except ImportError:
+            logging.warning("msvcrt unavailable; keyboard controls disabled")
+            return
+
+        while not self._stop_event.is_set():
+            if self._prompt_event.is_set():
+                time.sleep(0.1)
+                continue
+            if msvcrt.kbhit():
+                raw = msvcrt.getwch()
+                self._handle_key(raw)
+            time.sleep(0.1)
+
+    def _monitor_posix_keyboard(self) -> None:
+        if not sys.stdin.isatty():
+            logging.info("stdin is not a TTY; keyboard controls disabled")
+            return
+
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop_event.is_set():
+                if self._prompt_event.is_set():
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    while self._prompt_event.is_set() and not self._stop_event.is_set():
+                        time.sleep(0.1)
+                    tty.setcbreak(fd)
+                    continue
+                readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if readable:
+                    self._handle_key(sys.stdin.read(1))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+class KeyboardPromptSection:
+    """Temporarily pause background keyboard reads while normal input() is used."""
+
+    def __init__(self, controller: KeyboardController) -> None:
+        self.controller = controller
+
+    def __enter__(self) -> None:
+        self.controller._prompt_event.set()
+        time.sleep(0.05)
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.controller._prompt_event.clear()
+
+
 class FFmpegAnalyzer:
     """Wrapper around ffprobe and FFmpeg capability checks."""
 
     def available_audio_encoders(self) -> set[str]:
         """Return the set of audio encoder names reported by FFmpeg."""
 
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
+        result = run_external_command(["ffmpeg", "-hide_banner", "-encoders"])
         if result.returncode != 0:
             raise RuntimeError(f"ffmpeg -encoders failed: {result.stderr.strip()}")
 
@@ -294,7 +561,7 @@ class FFmpegAnalyzer:
             "-show_chapters",
             str(path),
         ]
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        result = run_external_command(command)
         if result.returncode != 0:
             raise ProbeError(result.stderr.strip() or "ffprobe failed")
 
@@ -401,7 +668,9 @@ class ConversionPlanner:
         )
 
     def _target_bitrate(self, source_info: AudioInfo) -> int | None:
-        source_kbps = source_info.bitrate_kbps
+        """Choose a target bitrate from normalized 8 kbps source buckets."""
+
+        source_kbps = source_info.normalized_bitrate_kbps
         max_bitrate = self.config.max_bitrate_kbps
 
         if source_info.channels > 1:
@@ -507,7 +776,7 @@ class ValidationManager:
 
 
 class AudiobookConverter:
-    """Coordinate discovery, analysis, conversion, validation, and archiving."""
+    """Coordinate discovery, per-file transactions, progress, and user controls."""
 
     def __init__(
         self,
@@ -517,6 +786,7 @@ class AudiobookConverter:
         planner: ConversionPlanner,
         validator: ValidationManager,
         dry_run: bool,
+        keyboard: KeyboardController,
     ) -> None:
         self.config = config
         self.display = display
@@ -524,15 +794,23 @@ class AudiobookConverter:
         self.planner = planner
         self.validator = validator
         self.dry_run = dry_run
+        self.keyboard = keyboard
         self.stats = ProcessingStats()
 
     def run(self) -> ProcessingStats:
-        """Process every regular file below source_dir and return final counters."""
+        """Process every discovered file and honor pause/quit requests between transactions."""
 
         logging.info("Starting audiobook conversion; dry_run=%s", self.dry_run)
-        for path in self._discover_files():
-            self.stats.scanned += 1
+        files = self._discover_files()
+        self.stats.scanned = len(files)
+        self.display.info(f"Found {self.stats.scanned} files to process.", "scan")
+        logging.info("Discovered %s files to process", self.stats.scanned)
+
+        for path in files:
             self._process_one_file(path)
+            if self._handle_between_file_controls():
+                break
+
         logging.info("Finished audiobook conversion")
         return self.stats
 
@@ -541,52 +819,88 @@ class AudiobookConverter:
         return sorted(path for path in self.config.source_dir.rglob("*") if path.is_file())
 
     def _process_one_file(self, path: Path) -> None:
-        self.display.info(f"Scanning: {path.name}", "scan")
-        logging.info("Discovered file: %s", path)
+        """Run one complete file transaction and never let non-critical failures stop the batch."""
 
+        plan: ConversionPlan | None = None
         try:
-            source_info = self.analyzer.probe(path)
-            logging.info(
-                "Probe result for %s: bitrate=%s kbps, channels=%s, codec=%s, duration=%.2f, chapters=%s",
-                path,
-                source_info.bitrate_kbps,
-                source_info.channels,
-                source_info.codec,
-                source_info.duration_seconds,
-                source_info.chapter_count,
-            )
-        except ProbeError as exc:
-            self._skip(f"Skipped: {path.name} ({exc})")
-            logging.warning("Skipping unreadable or unsupported file %s: %s", path, exc)
-            return
-        except Exception:
-            self._fail(f"Failed: unexpected ffprobe error for {path.name}")
-            logging.exception("Unexpected probe error for %s", path)
-            return
+            self.display.info(f"Scanning: {path.name}", "scan")
+            logging.info("Discovered file: %s", path)
 
-        plan = self.planner.create_plan(source_info)
-        if plan is None:
-            self._skip(f"Skipped: bitrate below threshold ({source_info.bitrate_kbps} kbps)")
-            logging.warning("Skipping %s because bitrate is below threshold", path)
-            return
+            try:
+                source_info = self.analyzer.probe(path)
+                self._log_probe_result(path, source_info)
+            except ProbeError as exc:
+                self._skip(f"Skipped: {path.name} ({exc})")
+                logging.warning("Skipping unreadable or unsupported file %s: %s", path, exc)
+                return
 
+            plan = self.planner.create_plan(source_info)
+            if plan is None:
+                self._skip(
+                    f"Skipped: bitrate below threshold ({source_info.normalized_bitrate_kbps} kbps normalized)"
+                )
+                logging.warning(
+                    "Skipping %s because normalized bitrate is below threshold: raw=%s kbps normalized=%s kbps",
+                    path,
+                    source_info.bitrate_kbps,
+                    source_info.normalized_bitrate_kbps,
+                )
+                return
+
+            self._log_bitrate_decision(path, source_info, plan)
+
+            if plan.final_path.exists():
+                self._skip(f"Skipped: output already exists ({plan.final_path.name})")
+                logging.warning("Skipping %s because output already exists: %s", path, plan.final_path)
+                return
+
+            if self.dry_run:
+                self._describe_dry_run(source_info, plan)
+                self._skip(f"Dry run: planned conversion for {path.name}")
+                return
+
+            self._convert_validate_and_archive(source_info, plan)
+        except DiskSpaceError:
+            if plan is not None:
+                self._cleanup_temporary_output(plan)
+            logging.critical("Stopping immediately because disk-space exhaustion was detected", exc_info=True)
+            self.display.critical("Critical error: disk space exhausted. Stopping processing immediately.")
+            raise
+        except ForcedTermination:
+            raise
+        except Exception as exc:
+            if plan is not None:
+                self._cleanup_temporary_output(plan)
+            self._fail(f"Failed: {path.name} ({exc})")
+            logging.exception("File-level failure for %s; continuing with next file", path)
+        finally:
+            # A terminal state is reached only after logging, cleanup, counters,
+            # and any conversion/archive transaction work are complete.
+            self._mark_processed()
+
+    def _log_probe_result(self, path: Path, source_info: AudioInfo) -> None:
+        self.display.info(f"Detected bitrate: {source_info.bitrate_kbps} kbps")
+        self.display.info(f"Normalized bitrate: {source_info.normalized_bitrate_kbps} kbps")
         logging.info(
-            "Bitrate decision for %s: source=%s kbps, target=%s kbps",
+            "Probe result for %s: raw_bitrate=%s kbps, normalized_bitrate=%s kbps, channels=%s, codec=%s, duration=%.2f, chapters=%s",
             path,
             source_info.bitrate_kbps,
-            plan.target_bitrate_kbps,
+            source_info.normalized_bitrate_kbps,
+            source_info.channels,
+            source_info.codec,
+            source_info.duration_seconds,
+            source_info.chapter_count,
         )
 
-        if plan.final_path.exists():
-            self._skip(f"Skipped: output already exists ({plan.final_path.name})")
-            logging.warning("Skipping %s because output already exists: %s", path, plan.final_path)
-            return
-
-        if self.dry_run:
-            self._describe_dry_run(source_info, plan)
-            return
-
-        self._convert_validate_and_archive(source_info, plan)
+    def _log_bitrate_decision(self, path: Path, source_info: AudioInfo, plan: ConversionPlan) -> None:
+        self.display.info(f"Target bitrate: {plan.target_bitrate_kbps} kbps")
+        logging.info(
+            "Bitrate decision for %s: raw=%s kbps, normalized=%s kbps, target=%s kbps",
+            path,
+            source_info.bitrate_kbps,
+            source_info.normalized_bitrate_kbps,
+            plan.target_bitrate_kbps,
+        )
 
     def _describe_dry_run(self, source_info: AudioInfo, plan: ConversionPlan) -> None:
         self.display.info(f"Would convert: {plan.source_path.name} -> {plan.final_path}", "convert")
@@ -599,41 +913,53 @@ class AudiobookConverter:
         self.display.info(f"Converting: {plan.final_path.name}", "convert")
         logging.info("Converting %s to temporary output %s", plan.source_path, plan.temporary_path)
 
-        plan.temporary_path.unlink(missing_ok=True)
-        command = self._ffmpeg_command(plan)
-        result = subprocess.run(command, text=True, capture_output=True, check=False)
-        if result.returncode != 0:
-            plan.temporary_path.unlink(missing_ok=True)
-            self._fail("Failed: ffmpeg returned non-zero exit code")
-            logging.error("FFmpeg failed for %s: %s", plan.source_path, result.stderr.strip())
-            return
-
-        logging.info("FFmpeg conversion completed for %s", plan.source_path)
-        if not self.validator.validate(source_info, plan, plan.temporary_path):
-            plan.temporary_path.unlink(missing_ok=True)
-            self._fail("Failed: validation failed")
-            return
-
+        self.keyboard.register_temp_file(plan.temporary_path)
         try:
-            self._promote_temporary_output(plan)
-            logging.info("Promoted temporary output to final output: %s", plan.final_path)
-        except OSError:
-            plan.temporary_path.unlink(missing_ok=True)
-            self._fail("Failed: could not promote temporary output")
-            logging.exception("Could not promote %s to %s", plan.temporary_path, plan.final_path)
-            return
+            self._cleanup_temporary_output(plan)
+            command = self._ffmpeg_command(plan)
+            result = run_external_command(command)
+            if result.returncode != 0:
+                self._cleanup_temporary_output(plan)
+                if is_disk_space_error(result.stderr) or is_disk_space_error(result.stdout):
+                    raise DiskSpaceError(
+                        result.stderr.strip() or result.stdout.strip() or "ffmpeg reported disk-space exhaustion"
+                    )
+                self._fail("Failed: ffmpeg returned non-zero exit code")
+                logging.error("FFmpeg failed for %s: %s", plan.source_path, result.stderr.strip())
+                return
 
-        try:
-            self._archive_original(plan)
-        except OSError:
-            self._fail("Failed: could not archive original after conversion")
-            logging.exception("Could not archive original %s to %s", plan.source_path, plan.archive_path)
-            return
+            logging.info("FFmpeg conversion completed for %s", plan.source_path)
+            if not self.validator.validate(source_info, plan, plan.temporary_path):
+                self._cleanup_temporary_output(plan)
+                self._fail("Failed: validation failed")
+                return
 
-        self.stats.converted += 1
-        self.display.success("Conversion successful")
-        self.display.info("Archived original", "archive")
-        logging.info("Conversion and archive successful for %s", plan.source_path)
+            try:
+                self._promote_temporary_output(plan)
+                logging.info("Promoted temporary output to final output: %s", plan.final_path)
+            except OSError as exc:
+                self._cleanup_temporary_output(plan)
+                if is_disk_space_error(exc):
+                    raise DiskSpaceError(str(exc)) from exc
+                self._fail("Failed: could not promote temporary output")
+                logging.exception("Could not promote %s to %s", plan.temporary_path, plan.final_path)
+                return
+
+            try:
+                self._archive_original(plan)
+            except OSError as exc:
+                if is_disk_space_error(exc):
+                    raise DiskSpaceError(str(exc)) from exc
+                self._fail("Failed: could not archive original after conversion")
+                logging.exception("Could not archive original %s to %s", plan.source_path, plan.archive_path)
+                return
+
+            self.stats.converted += 1
+            self.display.success("Conversion successful")
+            self.display.info("Archived original", "archive")
+            logging.info("Conversion and archive successful for %s", plan.source_path)
+        finally:
+            self.keyboard.unregister_temp_file(plan.temporary_path)
 
     def _promote_temporary_output(self, plan: ConversionPlan) -> None:
         """Move the validated temporary file into place without overwriting.
@@ -679,6 +1005,14 @@ class AudiobookConverter:
         shutil.move(str(plan.source_path), str(plan.archive_path))
         logging.info("Archived original to %s", plan.archive_path)
 
+    def _cleanup_temporary_output(self, plan: ConversionPlan) -> None:
+        try:
+            plan.temporary_path.unlink(missing_ok=True)
+        except OSError as exc:
+            if is_disk_space_error(exc):
+                raise DiskSpaceError(str(exc)) from exc
+            logging.exception("Failed to clean temporary output %s", plan.temporary_path)
+
     def _skip(self, message: str) -> None:
         self.stats.skipped += 1
         self.display.warning(message)
@@ -686,6 +1020,53 @@ class AudiobookConverter:
     def _fail(self, message: str) -> None:
         self.stats.failed += 1
         self.display.error(message)
+
+    def _mark_processed(self) -> None:
+        self.stats.processed += 1
+        self._display_progress()
+
+    def _display_progress(self) -> None:
+        self.display.info(
+            "Progress:\n"
+            f"{self.stats.processed}/{self.stats.scanned} processed |\n"
+            f"{self.stats.remaining} remaining |\n"
+            f"{self.stats.converted} converted |\n"
+            f"{self.stats.skipped} skipped |\n"
+            f"{self.stats.failed} failed",
+            "summary",
+        )
+        logging.info(
+            "Progress: %s/%s processed; %s remaining; %s converted; %s skipped; %s failed",
+            self.stats.processed,
+            self.stats.scanned,
+            self.stats.remaining,
+            self.stats.converted,
+            self.stats.skipped,
+            self.stats.failed,
+        )
+
+    def _handle_between_file_controls(self) -> bool:
+        """Honor pause and quit requests only between completed file transactions."""
+
+        if self.keyboard.pause_requested:
+            self.display.warning("Pause requested.\nPress Enter to continue processing...")
+            logging.info("Processing paused after current file transaction")
+            with self.keyboard.prompt_section():
+                input()
+            self.keyboard.clear_pause()
+            logging.info("Processing resumed after pause")
+
+        if self.keyboard.quit_requested:
+            self.display.warning("Quit requested.\nDo you want to stop processing now? [y/N]:")
+            logging.info("Prompting for graceful quit confirmation")
+            with self.keyboard.prompt_section():
+                response = input().strip().casefold()
+            if response == "y":
+                logging.info("User confirmed graceful quit")
+                return True
+            logging.info("User declined graceful quit with response: %r", response)
+            self.keyboard.clear_quit()
+        return False
 
 
 def sanitize_filename(value: str) -> str:
@@ -757,6 +1138,8 @@ def print_summary(display: ConsoleDisplay, stats: ProcessingStats, elapsed: str)
     lines = [
         "Processing Complete",
         f"Files Scanned: {stats.scanned}",
+        f"Files Processed: {stats.processed}",
+        f"Remaining: {stats.remaining}",
         f"Converted: {stats.converted}",
         f"Skipped: {stats.skipped}",
         f"Failed: {stats.failed}",
@@ -784,15 +1167,20 @@ def main(argv: list[str] | None = None) -> int:
         logging.info("Startup complete; configuration loaded from %s", repo_cwd / CONFIG_FILE)
 
         with LockFile(repo_cwd / LOCK_FILE):
-            analyzer = FFmpegAnalyzer()
-            codec = choose_codec(analyzer, config, display)
-            planner = ConversionPlanner(config, codec)
-            validator = ValidationManager(analyzer)
-            converter = AudiobookConverter(config, display, analyzer, planner, validator, args.dry_run)
-            stats = converter.run()
-            print_summary(display, stats, format_elapsed(time.monotonic() - start_time))
-            logging.info("Shutdown complete")
-            return 0 if stats.failed == 0 else 1
+            keyboard = KeyboardController()
+            keyboard.start()
+            try:
+                analyzer = FFmpegAnalyzer()
+                codec = choose_codec(analyzer, config, display)
+                planner = ConversionPlanner(config, codec)
+                validator = ValidationManager(analyzer)
+                converter = AudiobookConverter(config, display, analyzer, planner, validator, args.dry_run, keyboard)
+                stats = converter.run()
+                print_summary(display, stats, format_elapsed(time.monotonic() - start_time))
+                logging.info("Shutdown complete")
+                return 0 if stats.failed == 0 else 1
+            finally:
+                keyboard.stop()
 
     except LockError as exc:
         ConsoleDisplay(use_color=not args.no_color, use_emoji=not args.no_emoji).error(str(exc))
@@ -805,6 +1193,15 @@ def main(argv: list[str] | None = None) -> int:
             f"Required executable not found: {exc.filename}"
         )
         return 1
+    except DiskSpaceError:
+        logging.critical("Clean shutdown after disk-space exhaustion")
+        return 1
+    except ForcedTermination:
+        ConsoleDisplay(use_color=not args.no_color, use_emoji=not args.no_emoji).critical(
+            "Forced termination requested; exiting immediately"
+        )
+        logging.critical("Forced termination requested; lock and temporary cleanup attempted")
+        return 130
     except KeyboardInterrupt:
         ConsoleDisplay(use_color=not args.no_color, use_emoji=not args.no_emoji).warning("Interrupted by user")
         logging.warning("Interrupted by user")
