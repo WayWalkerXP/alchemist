@@ -15,6 +15,7 @@ import errno
 import json
 import logging
 import os
+import re
 import select
 import shutil
 import signal
@@ -33,6 +34,7 @@ LOCK_FILE = "audiobook_converter.lock"
 EXTERNAL_PROCESS_LOCK = threading.Lock()
 ACTIVE_EXTERNAL_PROCESSES: set[subprocess.Popen[bytes]] = set()
 METADATA_KEYS = ("artist", "album_artist", "author", "composer", "title", "album")
+DRAMATIC_AUDIO_PHRASES = ("graphicaudio", "graphic audio", "dramatic audio", "audio drama", "full cast")
 INVALID_FILENAME_CHARS = '<>:"/\\|?*\0'
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -77,6 +79,26 @@ class AppConfig:
     log_file: Path
     use_color: bool
     use_emoji: bool
+    extract_cover: bool
+    cover_dir: Path | None
+
+
+@dataclass(frozen=True)
+class ArtworkStream:
+    """Embedded image stream selected for optional sidecar cover extraction."""
+
+    index: int
+    extension: str
+    disposition: str
+
+
+@dataclass(frozen=True)
+class DramaticAudioMatch:
+    """Details explaining why a source was classified as dramatic audio."""
+
+    field: str
+    value: str
+    phrase: str
 
 
 @dataclass(frozen=True)
@@ -90,6 +112,7 @@ class AudioInfo:
     duration_seconds: float
     chapter_count: int
     metadata: dict[str, str] = field(default_factory=dict)
+    artwork_stream: ArtworkStream | None = None
 
     @property
     def bitrate_kbps(self) -> int:
@@ -113,7 +136,15 @@ class ConversionPlan:
     temporary_path: Path
     archive_path: Path
     target_bitrate_kbps: int
+    output_channels: int
     codec: str
+    dramatic_audio_match: DramaticAudioMatch | None = None
+
+    @property
+    def output_channel_description(self) -> str:
+        """Return a human-readable output channel layout."""
+
+        return "mono" if self.output_channels == 1 else "stereo"
 
 
 @dataclass
@@ -167,6 +198,13 @@ class ConfigManager:
         fallback_codec = self._required_value(parser, "encoding", "fallback_codec")
         use_color = parser.getboolean("display", "use_color", fallback=True)
         use_emoji = parser.getboolean("display", "use_emoji", fallback=True)
+        extract_cover = parser.getboolean("artwork", "extract_cover", fallback=False)
+        cover_dir: Path | None = None
+        if extract_cover:
+            cover_dir_value = parser.get("artwork", "cover_dir", fallback="").strip()
+            if not cover_dir_value:
+                raise ConfigError("Missing required configuration value: [artwork] cover_dir")
+            cover_dir = Path(cover_dir_value).expanduser().resolve()
 
         for directory in (source_dir, target_dir, converted_dir):
             directory.mkdir(parents=True, exist_ok=True)
@@ -191,6 +229,8 @@ class ConfigManager:
             log_file=log_file,
             use_color=use_color,
             use_emoji=use_emoji,
+            extract_cover=extract_cover,
+            cover_dir=cover_dir,
         )
 
     def _required_value(self, parser: configparser.ConfigParser, section: str, key: str) -> str:
@@ -594,6 +634,7 @@ class FFmpegAnalyzer:
             duration_seconds=duration_seconds,
             chapter_count=len(data.get("chapters", [])),
             metadata=self._extract_metadata(data, audio_stream),
+            artwork_stream=self._select_artwork_stream(data),
         )
 
     def _primary_audio_stream(self, data: dict[str, Any]) -> dict[str, Any] | None:
@@ -632,11 +673,73 @@ class FFmpegAnalyzer:
                 metadata[key] = value
         return metadata
 
+    def _select_artwork_stream(self, data: dict[str, Any]) -> ArtworkStream | None:
+        """Return the preferred embedded cover stream, if ffprobe reported one."""
+
+        candidates: list[tuple[int, ArtworkStream]] = []
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") != "video":
+                continue
+            disposition = stream.get("disposition", {}) or {}
+            tags = {str(key).casefold(): str(value).casefold() for key, value in stream.get("tags", {}).items()}
+            attached_pic = self._safe_int(disposition.get("attached_pic"), default=0) == 1
+            title = tags.get("title", "")
+            comment = tags.get("comment", "")
+            if not attached_pic and "cover" not in title and "cover" not in comment:
+                continue
+
+            index = self._safe_int(stream.get("index"), default=-1)
+            if index < 0:
+                continue
+            extension = self._artwork_extension(str(stream.get("codec_name", "")))
+            disposition_name = "front cover" if "front" in comment or "front" in title else "attached picture"
+            priority = 0 if "front" in comment or "front" in title else 1
+            candidates.append((priority, ArtworkStream(index=index, extension=extension, disposition=disposition_name)))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1].index))
+        return candidates[0][1]
+
+    def _artwork_extension(self, codec_name: str) -> str:
+        """Map common embedded image codecs to sidecar filename extensions."""
+
+        normalized = codec_name.casefold()
+        if normalized in {"png", "apng"}:
+            return "png"
+        if normalized in {"mjpeg", "jpeg", "jpg"}:
+            return "jpg"
+        return "jpg"
+
     def _safe_int(self, value: Any, default: int) -> int:
         try:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+
+def normalize_match_text(value: str) -> str:
+    """Normalize free text before phrase matching."""
+
+    cleaned = re.sub(r"[_\W]+", " ", value.casefold(), flags=re.UNICODE)
+    return " ".join(cleaned.split())
+
+
+def detect_dramatic_audio(source_info: AudioInfo) -> DramaticAudioMatch | None:
+    """Detect GraphicAudio-style or full-cast dramatic productions."""
+
+    checks: list[tuple[str, str]] = [(key, value) for key, value in source_info.metadata.items() if value]
+    checks.append(("filename", source_info.path.name))
+    normalized_phrases = [(phrase, normalize_match_text(phrase)) for phrase in DRAMATIC_AUDIO_PHRASES]
+
+    for field_name, original_value in checks:
+        normalized_value = normalize_match_text(original_value)
+        compact_value = normalized_value.replace(" ", "")
+        for original_phrase, normalized_phrase in normalized_phrases:
+            compact_phrase = normalized_phrase.replace(" ", "")
+            if normalized_phrase in normalized_value or compact_phrase in compact_value:
+                return DramaticAudioMatch(field=field_name, value=original_value, phrase=original_phrase)
+    return None
 
 
 class ConversionPlanner:
@@ -646,12 +749,17 @@ class ConversionPlanner:
         self.config = config
         self.codec = codec
 
-    def create_plan(self, source_info: AudioInfo) -> ConversionPlan | None:
+    def create_plan(
+        self, source_info: AudioInfo, dramatic_match: DramaticAudioMatch | None = None
+    ) -> ConversionPlan | None:
         """Return a conversion plan, or None when bitrate rules require a skip."""
 
-        target_bitrate_kbps = self._target_bitrate(source_info)
+        if dramatic_match is None:
+            dramatic_match = detect_dramatic_audio(source_info)
+        target_bitrate_kbps = self._target_bitrate(source_info, dramatic_match)
         if target_bitrate_kbps is None:
             return None
+        output_channels = 2 if dramatic_match is not None and source_info.channels > 1 else 1
 
         output_name = self._output_filename(source_info)
         final_path = self.config.target_dir / output_name
@@ -664,14 +772,19 @@ class ConversionPlanner:
             temporary_path=temporary_path,
             archive_path=archive_path,
             target_bitrate_kbps=target_bitrate_kbps,
+            output_channels=output_channels,
             codec=self.codec,
+            dramatic_audio_match=dramatic_match,
         )
 
-    def _target_bitrate(self, source_info: AudioInfo) -> int | None:
+    def _target_bitrate(self, source_info: AudioInfo, dramatic_match: DramaticAudioMatch | None) -> int | None:
         """Choose a target bitrate from normalized 8 kbps source buckets."""
 
         source_kbps = source_info.normalized_bitrate_kbps
         max_bitrate = self.config.max_bitrate_kbps
+
+        if source_info.channels > 1 and dramatic_match is not None:
+            return 128 if source_kbps >= 128 else 64
 
         if source_info.channels > 1:
             if source_kbps >= 128:
@@ -729,8 +842,13 @@ class ValidationManager:
             logging.error("Validation failed; output is not readable: %s", exc)
             return False
 
-        if output_info.channels != 1:
-            logging.error("Validation failed; expected mono audio, found %s channel(s)", output_info.channels)
+        if output_info.channels != plan.output_channels:
+            logging.error(
+                "Validation failed; expected %s audio (%s channel(s)), found %s channel(s)",
+                plan.output_channel_description,
+                plan.output_channels,
+                output_info.channels,
+            )
             return False
 
         if not self._bitrate_matches(output_info.bitrate_bps, plan.target_bitrate_kbps * 1000):
@@ -775,6 +893,101 @@ class ValidationManager:
                 logging.warning("Metadata appears missing in output: %s", key)
 
 
+class CoverArtExtractor:
+    """Best-effort embedded cover extraction to sidecar image files."""
+
+    def __init__(self, config: AppConfig, display: ConsoleDisplay, dry_run: bool) -> None:
+        self.config = config
+        self.display = display
+        self.dry_run = dry_run
+
+    def plan_cover_path(self, source_info: AudioInfo) -> Path | None:
+        """Return the configured sidecar cover path, if extraction is enabled and artwork exists."""
+
+        if not self.config.extract_cover:
+            logging.info("Cover extraction disabled by configuration")
+            return None
+        if source_info.artwork_stream is None:
+            logging.info("No embedded cover art found in %s", source_info.path)
+            return None
+        if self.config.cover_dir is None:
+            logging.warning("Cover extraction enabled without a configured cover_dir")
+            return None
+        stem = sanitize_filename(source_info.path.stem)
+        return self.config.cover_dir / f"{stem}.{source_info.artwork_stream.extension}"
+
+    def extract(self, source_info: AudioInfo) -> None:
+        """Extract the selected embedded cover, logging warnings without failing conversion."""
+
+        cover_path = self.plan_cover_path(source_info)
+        if cover_path is None:
+            return
+
+        assert source_info.artwork_stream is not None
+        if self.dry_run:
+            self.display.info(f"Would extract cover art to: {cover_path}")
+            logging.info("Dry run cover extraction plan for %s: %s", source_info.path, cover_path)
+            return
+
+        temporary_path: Path | None = None
+        try:
+            if cover_path.exists():
+                warning = f"Cover already exists; not overwriting: {cover_path}"
+                self.display.warning(warning)
+                logging.warning(warning)
+                return
+
+            cover_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = cover_path.with_name(f"{cover_path.stem}.tmp{cover_path.suffix}")
+            temporary_path.unlink(missing_ok=True)
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-y",
+                "-i",
+                str(source_info.path),
+                "-map",
+                f"0:{source_info.artwork_stream.index}",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                str(temporary_path),
+            ]
+            result = run_external_command(command)
+            if result.returncode != 0:
+                temporary_path.unlink(missing_ok=True)
+                warning = f"Cover extraction failed for {source_info.path.name}; continuing conversion"
+                self.display.warning(warning)
+                logging.warning("%s: %s", warning, result.stderr.strip())
+                return
+
+            if not temporary_path.exists():
+                warning = f"Cover extraction produced no file for {source_info.path.name}; continuing conversion"
+                self.display.warning(warning)
+                logging.warning(warning)
+                return
+            os.link(temporary_path, cover_path)
+            temporary_path.unlink()
+            self.display.info(f"Extracted cover art: {cover_path}")
+            logging.info(
+                "Extracted %s stream %s from %s to %s",
+                source_info.artwork_stream.disposition,
+                source_info.artwork_stream.index,
+                source_info.path,
+                cover_path,
+            )
+        except Exception as exc:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    logging.exception("Failed to clean temporary cover output %s", temporary_path)
+            warning = f"Cover extraction failed for {source_info.path.name}; continuing conversion"
+            self.display.warning(warning)
+            logging.warning("%s: %s", warning, exc, exc_info=True)
+
+
 class AudiobookConverter:
     """Coordinate discovery, per-file transactions, progress, and user controls."""
 
@@ -785,6 +998,7 @@ class AudiobookConverter:
         analyzer: FFmpegAnalyzer,
         planner: ConversionPlanner,
         validator: ValidationManager,
+        cover_extractor: CoverArtExtractor,
         dry_run: bool,
         keyboard: KeyboardController,
     ) -> None:
@@ -793,6 +1007,7 @@ class AudiobookConverter:
         self.analyzer = analyzer
         self.planner = planner
         self.validator = validator
+        self.cover_extractor = cover_extractor
         self.dry_run = dry_run
         self.keyboard = keyboard
         self.stats = ProcessingStats()
@@ -829,12 +1044,14 @@ class AudiobookConverter:
             try:
                 source_info = self.analyzer.probe(path)
                 self._log_probe_result(path, source_info)
+                dramatic_match = detect_dramatic_audio(source_info)
+                self._log_dramatic_audio_detection(path, dramatic_match)
             except ProbeError as exc:
                 self._skip(f"Skipped: {path.name} ({exc})")
                 logging.warning("Skipping unreadable or unsupported file %s: %s", path, exc)
                 return
 
-            plan = self.planner.create_plan(source_info)
+            plan = self.planner.create_plan(source_info, dramatic_match)
             if plan is None:
                 self._skip(
                     f"Skipped: bitrate below threshold ({source_info.normalized_bitrate_kbps} kbps normalized)"
@@ -856,9 +1073,11 @@ class AudiobookConverter:
 
             if self.dry_run:
                 self._describe_dry_run(source_info, plan)
+                self.cover_extractor.extract(source_info)
                 self._skip(f"Dry run: planned conversion for {path.name}")
                 return
 
+            self.cover_extractor.extract(source_info)
             self._convert_validate_and_archive(source_info, plan)
         except DiskSpaceError:
             if plan is not None:
@@ -892,20 +1111,42 @@ class AudiobookConverter:
             source_info.chapter_count,
         )
 
+    def _log_dramatic_audio_detection(self, path: Path, match: DramaticAudioMatch | None) -> None:
+        if match is None:
+            logging.info("Dramatic audio not detected for %s", path)
+            return
+        logging.info(
+            "Dramatic audio detected for %s from %s=%r using phrase %r",
+            path,
+            match.field,
+            match.value,
+            match.phrase,
+        )
+        self.display.info(f"Dramatic audio detected from {match.field}: {match.value}")
+
     def _log_bitrate_decision(self, path: Path, source_info: AudioInfo, plan: ConversionPlan) -> None:
+        self.display.info(f"Output channels: {plan.output_channel_description} ({plan.output_channels})")
         self.display.info(f"Target bitrate: {plan.target_bitrate_kbps} kbps")
         logging.info(
-            "Bitrate decision for %s: raw=%s kbps, normalized=%s kbps, target=%s kbps",
+            "Conversion decision for %s: raw=%s kbps, normalized=%s kbps, source_channels=%s, output_channels=%s, target=%s kbps",
             path,
             source_info.bitrate_kbps,
             source_info.normalized_bitrate_kbps,
+            source_info.channels,
+            plan.output_channels,
             plan.target_bitrate_kbps,
         )
 
     def _describe_dry_run(self, source_info: AudioInfo, plan: ConversionPlan) -> None:
         self.display.info(f"Would convert: {plan.source_path.name} -> {plan.final_path}", "convert")
-        self.display.info(f"Would use codec {plan.codec} at {plan.target_bitrate_kbps} kbps mono")
-        self.display.info(f"Would validate duration, bitrate, mono audio, and {source_info.chapter_count} chapter(s)")
+        self.display.info(
+            f"Would use codec {plan.codec} at {plan.target_bitrate_kbps} kbps "
+            f"{plan.output_channel_description}"
+        )
+        self.display.info(
+            f"Would validate duration, bitrate, {plan.output_channel_description} audio, "
+            f"and {source_info.chapter_count} chapter(s)"
+        )
         self.display.info(f"Would archive original to: {plan.archive_path}", "archive")
         logging.info("Dry run plan: %s", plan)
 
@@ -988,7 +1229,7 @@ class AudiobookConverter:
             "0",
             "-vn",
             "-ac",
-            "1",
+            str(plan.output_channels),
             "-c:a",
             plan.codec,
             "-b:a",
@@ -1174,7 +1415,10 @@ def main(argv: list[str] | None = None) -> int:
                 codec = choose_codec(analyzer, config, display)
                 planner = ConversionPlanner(config, codec)
                 validator = ValidationManager(analyzer)
-                converter = AudiobookConverter(config, display, analyzer, planner, validator, args.dry_run, keyboard)
+                cover_extractor = CoverArtExtractor(config, display, args.dry_run)
+                converter = AudiobookConverter(
+                    config, display, analyzer, planner, validator, cover_extractor, args.dry_run, keyboard
+                )
                 stats = converter.run()
                 print_summary(display, stats, format_elapsed(time.monotonic() - start_time))
                 logging.info("Shutdown complete")
