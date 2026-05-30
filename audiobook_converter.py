@@ -1205,14 +1205,48 @@ class AudiobookConverter:
     def _promote_temporary_output(self, plan: ConversionPlan) -> None:
         """Move the validated temporary file into place without overwriting.
 
-        The temporary and final files live in the same directory, so a hard link is
-        a safe way to create the final path with O_EXCL-like behavior.  If the
-        final path appeared after duplicate planning, os.link fails instead of
-        replacing someone else's file.
+        Temporary outputs are expected to be created directly in the configured
+        target directory alongside their final output names.  The duplicate
+        output check immediately before promotion preserves no-overwrite
+        behavior even though os.replace itself would replace an existing file.
         """
 
-        os.link(plan.temporary_path, plan.final_path)
-        plan.temporary_path.unlink()
+        target_dir = self.config.target_dir.resolve()
+        temporary_parent = plan.temporary_path.parent.resolve()
+        final_parent = plan.final_path.parent.resolve()
+        paths_share_target_dir = (
+            temporary_parent == target_dir and final_parent == target_dir
+        )
+        if not paths_share_target_dir:
+            raise OSError(
+                errno.EINVAL,
+                "temporary and final outputs must both be in the configured target directory",
+                str(plan.temporary_path),
+            )
+
+        if plan.final_path.exists():
+            raise FileExistsError(
+                errno.EEXIST,
+                "refusing to overwrite existing output",
+                str(plan.final_path),
+            )
+
+        try:
+            os.replace(plan.temporary_path, plan.final_path)
+            logging.info(
+                "Promoted temporary output using os.replace: %s -> %s",
+                plan.temporary_path,
+                plan.final_path,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            logging.warning(
+                "os.replace reported a cross-device promotion for %s -> %s; falling back to shutil.move",
+                plan.temporary_path,
+                plan.final_path,
+            )
+            shutil.move(plan.temporary_path, plan.final_path)
 
     def _ffmpeg_command(self, plan: ConversionPlan) -> list[str]:
         return [
