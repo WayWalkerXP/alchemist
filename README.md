@@ -507,13 +507,8 @@ The converter will:
 
 # License
 
-Add your preferred license here.
-
-Examples:
-
-- MIT
 - GPLv3
-- Apache 2.0
+For more information, refer to LICENSE file.
 
 ---
 
