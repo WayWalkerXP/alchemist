@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import csv
 import errno
 import json
 import logging
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ from typing import Any
 from colorama import Fore, Style, init as colorama_init
 
 CONFIG_FILE = "audiobook_converter.ini"
+RUN_HISTORY_CSV = "audiobook_converter_runs.csv"
 LOCK_FILE = "audiobook_converter.lock"
 EXTERNAL_PROCESS_LOCK = threading.Lock()
 ACTIVE_EXTERNAL_PROCESSES: set[subprocess.Popen[bytes]] = set()
@@ -81,6 +84,7 @@ class AppConfig:
     use_emoji: bool
     extract_cover: bool
     cover_dir: Path | None
+    run_history_csv: Path
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,8 @@ class ProcessingStats:
     converted: int = 0
     skipped: int = 0
     failed: int = 0
+    bytes_original: int = 0
+    bytes_after_conversion: int = 0
 
     @property
     def remaining(self) -> int:
@@ -165,7 +171,7 @@ class ProcessingStats:
 
 
 class ConfigManager:
-    """Load and validate configuration from audiobook_converter.ini."""
+    """Load and validate configuration from the selected INI file."""
 
     REQUIRED_SECTIONS = ("paths", "encoding", "general", "display")
 
@@ -189,6 +195,7 @@ class ConfigManager:
         target_dir = self._required_path(parser, "paths", "target_dir")
         converted_dir = self._required_path(parser, "paths", "converted_dir")
         log_file = Path(self._required_value(parser, "general", "log_file")).expanduser().resolve()
+        run_history_csv = self._optional_path(parser, "reporting", "run_history_csv", RUN_HISTORY_CSV)
 
         max_bitrate_kbps = parser.getint("encoding", "max_bitrate", fallback=64)
         if max_bitrate_kbps <= 0:
@@ -218,6 +225,7 @@ class ConfigManager:
                 raise ConfigError(f"[paths] {label} must not be inside source_dir")
 
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        run_history_csv.parent.mkdir(parents=True, exist_ok=True)
 
         return AppConfig(
             source_dir=source_dir,
@@ -231,6 +239,7 @@ class ConfigManager:
             use_emoji=use_emoji,
             extract_cover=extract_cover,
             cover_dir=cover_dir,
+            run_history_csv=run_history_csv,
         )
 
     def _required_value(self, parser: configparser.ConfigParser, section: str, key: str) -> str:
@@ -241,6 +250,109 @@ class ConfigManager:
 
     def _required_path(self, parser: configparser.ConfigParser, section: str, key: str) -> Path:
         return Path(self._required_value(parser, section, key)).expanduser().resolve()
+
+    def _optional_path(self, parser: configparser.ConfigParser, section: str, key: str, default: str) -> Path:
+        """Return an optional path, accepting missing sections/options but not blank configured values."""
+
+        if parser.has_option(section, key):
+            value = parser.get(section, key, fallback="").strip()
+            if not value:
+                raise ConfigError(f"Missing required configuration value: [{section}] {key}")
+        else:
+            value = default
+        return Path(value).expanduser().resolve()
+
+
+class ConfigurationWizard:
+    """Create a first-run configuration when the selected INI file is missing."""
+
+    PROMPTS: tuple[tuple[str, tuple[tuple[str, str | None], ...]], ...] = (
+        ("paths", (("source_dir", None), ("target_dir", None), ("converted_dir", None))),
+        ("encoding", (("max_bitrate", "64"), ("codec", "libfdk_aac"), ("fallback_codec", "aac"))),
+        ("general", (("log_file", "audiobook_converter.log"),)),
+        ("display", (("use_color", "true"), ("use_emoji", "true"),)),
+        ("artwork", (("extract_cover", "false"),)),
+    )
+
+    TEMPLATE_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("paths", ("source_dir", "target_dir", "converted_dir")),
+        ("encoding", ("max_bitrate", "codec", "fallback_codec")),
+        ("general", ("log_file",)),
+        ("display", ("use_color", "use_emoji")),
+        ("artwork", ("extract_cover", "cover_dir")),
+        ("reporting", ("run_history_csv",)),
+    )
+
+    def __init__(self, config_path: Path) -> None:
+        self.config_path = config_path
+
+    def run(self) -> bool:
+        """Run the wizard and return True when processing should continue."""
+
+        print(f"No configuration file was found at: {self.config_path}")
+        print("Starting the interactive configuration wizard.\n")
+        parser = self._collect_values()
+        print("\nPlease review the generated configuration:\n")
+        print(self._to_ini(parser))
+        response = input("Are these settings correct? [Y/n] ").strip().casefold()
+        if response in {"", "y", "yes"}:
+            self._write(parser)
+            print(f"\nConfiguration written to:\n    {self.config_path}\n")
+            return True
+
+        self.write_template()
+        print(f"\nConfiguration template written to:\n    {self.config_path}\n")
+        print("Please edit the file and rerun the converter.")
+        return False
+
+    def _collect_values(self) -> configparser.ConfigParser:
+        parser = configparser.ConfigParser()
+        extract_cover = False
+
+        for section, prompts in self.PROMPTS:
+            parser[section] = {}
+            print(f"[{section}]")
+            for key, default in prompts:
+                value = self._prompt_value(key, default)
+                parser[section][key] = value
+                if section == "artwork" and key == "extract_cover":
+                    extract_cover = value.casefold() in {"1", "yes", "y", "true", "on"}
+            if section == "artwork" and extract_cover:
+                parser[section]["cover_dir"] = self._prompt_value("cover_dir", None)
+            print()
+
+        parser["reporting"] = {"run_history_csv": RUN_HISTORY_CSV}
+        return parser
+
+    def _prompt_value(self, key: str, default: str | None) -> str:
+        prompt = f"{key}"
+        if default is not None:
+            prompt += f" [{default}]"
+        prompt += ": "
+        value = input(prompt).strip()
+        if value:
+            return value
+        return default or ""
+
+    def _to_ini(self, parser: configparser.ConfigParser) -> str:
+        lines: list[str] = []
+        for section in parser.sections():
+            lines.append(f"[{section}]")
+            for key, value in parser[section].items():
+                lines.append(f"{key} = {value}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def _write(self, parser: configparser.ConfigParser) -> None:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.config_path.open("w", encoding="utf-8") as config_file:
+            parser.write(config_file)
+
+    def write_template(self) -> None:
+        parser = configparser.ConfigParser()
+        for section, keys in self.TEMPLATE_SECTIONS:
+            parser[section] = {key: "" for key in keys}
+        self._write(parser)
 
 
 class ConsoleDisplay:
@@ -1186,6 +1298,9 @@ class AudiobookConverter:
                 logging.exception("Could not promote %s to %s", plan.temporary_path, plan.final_path)
                 return
 
+            original_size = plan.source_path.stat().st_size
+            converted_size = plan.final_path.stat().st_size
+
             try:
                 self._archive_original(plan)
             except OSError as exc:
@@ -1196,6 +1311,8 @@ class AudiobookConverter:
                 return
 
             self.stats.converted += 1
+            self.stats.bytes_original += original_size
+            self.stats.bytes_after_conversion += converted_size
             self.display.success("Conversion successful")
             self.display.info("Archived original", "archive")
             logging.info("Conversion and archive successful for %s", plan.source_path)
@@ -1303,10 +1420,10 @@ class AudiobookConverter:
     def _display_progress(self) -> None:
         self.display.info(
             "Progress:\n"
-            f"{self.stats.processed}/{self.stats.scanned} processed |\n"
-            f"{self.stats.remaining} remaining |\n"
-            f"{self.stats.converted} converted |\n"
-            f"{self.stats.skipped} skipped |\n"
+            f"{self.stats.processed}/{self.stats.scanned} processed | "
+            f"{self.stats.remaining} remaining | "
+            f"{self.stats.converted} converted | "
+            f"{self.stats.skipped} skipped | "
             f"{self.stats.failed} failed",
             "summary",
         )
@@ -1378,6 +1495,62 @@ def choose_codec(analyzer: FFmpegAnalyzer, config: AppConfig, display: ConsoleDi
     )
 
 
+class RunHistoryReporter:
+    """Append one persistent CSV row summarizing each completed converter run."""
+
+    HEADER = [
+        "date",
+        "time",
+        "numBooksProcessed",
+        "numBytesOriginal",
+        "numBytesAfterConversion",
+        "numBytesDiff",
+        "pctDiff",
+        "runTime",
+    ]
+
+    def __init__(self, csv_path: Path) -> None:
+        self.csv_path = csv_path
+
+    def append(self, stats: ProcessingStats, elapsed: str) -> None:
+        """Create the run-history CSV if needed, then append calculated run totals."""
+
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        should_create = not self.csv_path.exists()
+        if should_create:
+            logging.info("Creating run history CSV: %s", self.csv_path)
+
+        now = datetime.now()
+        bytes_diff = stats.bytes_original - stats.bytes_after_conversion
+        pct_diff = (bytes_diff / stats.bytes_original) * 100 if stats.bytes_original else 0.0
+        row = [
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%H:%M:%S"),
+            stats.converted,
+            stats.bytes_original,
+            stats.bytes_after_conversion,
+            bytes_diff,
+            f"{pct_diff:.2f}",
+            elapsed,
+        ]
+        logging.info(
+            "Run history totals: converted=%s, original_bytes=%s, converted_bytes=%s, diff_bytes=%s, pct_diff=%.2f, runtime=%s",
+            stats.converted,
+            stats.bytes_original,
+            stats.bytes_after_conversion,
+            bytes_diff,
+            pct_diff,
+            elapsed,
+        )
+
+        with self.csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            if should_create:
+                writer.writerow(self.HEADER)
+            writer.writerow(row)
+        logging.info("Appended run history CSV row to %s", self.csv_path)
+
+
 def configure_logging(log_file: Path) -> None:
     """Configure file logging for all application activity."""
 
@@ -1401,6 +1574,7 @@ def format_elapsed(seconds: float) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert audiobook files to validated M4B outputs.")
+    parser.add_argument("--config", default=CONFIG_FILE, help="Path to the INI configuration file.")
     parser.add_argument("--dry-run", action="store_true", help="Analyze and display actions without modifying files.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored console output.")
     parser.add_argument("--no-emoji", action="store_true", help="Disable emoji output.")
@@ -1432,14 +1606,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     start_time = time.monotonic()
     repo_cwd = Path.cwd()
+    config_path = Path(args.config).expanduser()
+    if not config_path.is_absolute():
+        config_path = repo_cwd / config_path
+    config_path = config_path.resolve()
 
     try:
-        config = ConfigManager(repo_cwd / CONFIG_FILE).load()
+        if not config_path.exists() and not ConfigurationWizard(config_path).run():
+            return 0
+
+        config = ConfigManager(config_path).load()
         use_color = config.use_color and not args.no_color
         use_emoji = config.use_emoji and not args.no_emoji
         display = ConsoleDisplay(use_color=use_color, use_emoji=use_emoji)
         configure_logging(config.log_file)
-        logging.info("Startup complete; configuration loaded from %s", repo_cwd / CONFIG_FILE)
+        logging.info("Startup complete; configuration loaded from %s", config_path)
 
         with LockFile(repo_cwd / LOCK_FILE):
             keyboard = KeyboardController()
@@ -1454,7 +1635,9 @@ def main(argv: list[str] | None = None) -> int:
                     config, display, analyzer, planner, validator, cover_extractor, args.dry_run, keyboard
                 )
                 stats = converter.run()
-                print_summary(display, stats, format_elapsed(time.monotonic() - start_time))
+                elapsed = format_elapsed(time.monotonic() - start_time)
+                print_summary(display, stats, elapsed)
+                RunHistoryReporter(config.run_history_csv).append(stats, elapsed)
                 logging.info("Shutdown complete")
                 return 0 if stats.failed == 0 else 1
             finally:
