@@ -220,3 +220,6 @@ __marimo__/
 .env
 *.db
 
+# Ignore Sample Data, but keep the folder structure and any .gitkeep files that may be present. This allows you to keep the sample_data directory in your repository while ignoring its contents.
+sample_data/*
+!sample_data/.gitkeep

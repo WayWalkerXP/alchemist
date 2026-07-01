@@ -180,13 +180,13 @@ def make_m4b(book, output):
     cover = tmp / "cover.jpg"
     make_audio(wav, book.duration_seconds, book.channels)
     metadata_file(book, meta)
-    cmd = ["ffmpeg","-y","-i",str(wav),"-i",str(meta),"-map_metadata","1"]
+    cmd = ["ffmpeg","-y","-i",str(wav),"-f","ffmetadata","-i",str(meta)]
     if book.cover:
         make_cover(cover)
-        cmd += ["-i",str(cover),"-map","0:a","-map","2:v","-disposition:v","attached_pic"]
+        cmd += ["-i",str(cover),"-map","0:a","-map","2:v","-c:v","mjpeg","-disposition:v","attached_pic"]
     else:
         cmd += ["-map","0:a"]
-    cmd += ["-c:a","aac","-b:a",book.bitrate,"-ac",str(book.channels),"-movflags","use_metadata_tags",str(output)]
+    cmd += ["-map_metadata","1","-c:a","aac","-b:a",book.bitrate,"-ac",str(book.channels),"-movflags","use_metadata_tags",str(output)]
     run(cmd)
     shutil.rmtree(tmp)
 
