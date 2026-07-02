@@ -20,6 +20,13 @@ Alchemist is a cross-platform desktop application for audiobook metadata managem
 
 This document is not a feature specification. It defines the architectural boundaries, responsibilities, dependency rules, and system patterns that future subsystem specifications must follow.
 
+This specification implements and must remain consistent with the governing Architecture Decision Records:
+
+- ADR-0001 — Architectural Foundation
+- ADR-0002 — Canonical Metadata and Metadata Resolution
+- ADR-0003 — Identity Strategy
+- ADR-0004 — Execution Plans and Operation Records
+
 ---
 
 # 2. Architectural Goals
@@ -35,6 +42,8 @@ Alchemist must be:
 - **Cross-platform** — Windows, Linux, and macOS must be supported.
 - **Extensible** — future features should be added through well-defined seams.
 
+When goals conflict, protecting the user's library takes precedence.
+
 ---
 
 # 3. Core Architecture
@@ -46,6 +55,8 @@ UI Layer
    ↓
 Command Layer
    ↓
+Execution Planning / Execution Layer
+   ↓
 Service Layer
    ↓
 Persistence / External Systems
@@ -56,6 +67,22 @@ The direction of dependency is downward only.
 Higher layers may depend on lower layers.
 
 Lower layers must not depend on higher layers.
+
+The conceptual workflow is:
+
+```text
+User Intent
+   ↓
+Command
+   ↓
+Execution Plan
+   ↓
+Approval / Decision Gates
+   ↓
+Execution
+   ↓
+Operation Record
+```
 
 ---
 
@@ -71,8 +98,9 @@ It may:
 - Capture user intent.
 - Show progress.
 - Show warnings and confirmations.
-- Render execution plans.
-- Display operation results.
+- Render Execution Plans.
+- Display Operation Records and operation results.
+- Collect user decisions at Decision Gates.
 
 It must not:
 
@@ -82,12 +110,13 @@ It must not:
 - Perform duplicate detection directly.
 - Perform filesystem move/copy/delete operations directly.
 - Contain core business rules.
+- Execute service workflows directly.
 
-The UI should communicate user intent by creating or invoking commands.
+The UI communicates user intent by invoking Commands and presenting the resulting Execution Plans.
 
 ## 4.2 Command Layer
 
-Commands coordinate meaningful user operations.
+Commands translate user intent into Execution Plans.
 
 Examples:
 
@@ -101,19 +130,36 @@ Examples:
 
 Commands are responsible for:
 
-- Validation.
-- Building an Execution Plan.
-- Requesting user confirmation where appropriate.
-- Executing service calls in the correct order.
-- Creating operation records.
-- Handling recoverable failure states.
-- Reporting progress and results.
+- Validating command inputs.
+- Gathering required context.
+- Building Execution Plans.
+- Declaring approval requirements.
+- Declaring Decision Gates when human judgment is required.
+- Returning plan-generation errors when a plan cannot be built safely.
 
-Every significant operation should be represented by a command.
+Commands are workflow generators, not workflow executors.
 
-## 4.3 Service Layer
+Every significant operation should be represented by a Command.
 
-Services implement business logic.
+## 4.3 Execution Planning / Execution Layer
+
+Execution Plans are first-class architectural objects.
+
+The execution layer is responsible for:
+
+- Validating an approved plan is still valid.
+- Executing approved plan steps.
+- Pausing at Decision Gates.
+- Emitting progress events.
+- Recording step outcomes.
+- Producing Operation Records.
+- Stopping safely when the environment invalidates the approved plan.
+
+Approved Execution Plans are immutable. If the environment changes in a way that could affect the outcome, the plan must be invalidated and rebuilt.
+
+## 4.4 Service Layer
+
+Services implement focused business capabilities.
 
 Examples:
 
@@ -133,7 +179,7 @@ Services should receive input models and return output models, results, or domai
 
 Services should avoid directly manipulating UI state.
 
-## 4.4 Persistence Layer
+## 4.5 Persistence Layer
 
 SQLite is used for:
 
@@ -148,11 +194,13 @@ SQLite is used for:
 
 SQLite is not the source of truth for audiobook metadata.
 
-The user's files and Audiobookshelf metadata remain authoritative depending on context.
+For local audiobook metadata, the user's audio files and associated sidecar metadata files are the source of truth.
+
+Audiobookshelf may be treated as an external reference source or operational system, but Alchemist must not treat ABS cache data as authoritative over local files unless a user explicitly chooses an ABS-sourced update through an Execution Plan.
 
 Do not store cover art blobs in SQLite.
 
-## 4.5 External Systems
+## 4.6 External Systems
 
 External systems include:
 
@@ -161,9 +209,10 @@ External systems include:
 - FFmpeg / FFprobe.
 - Audiobookshelf API.
 - Audiobookshelf metadata files.
+- OPF / NFO / sidecar metadata files.
 - OS file browser / media playback services.
 
-Access to external systems must be wrapped in services.
+Access to external systems must be wrapped in services or external adapters.
 
 ---
 
@@ -174,9 +223,13 @@ Access to external systems must be wrapped in services.
 ```text
 ui → commands
 ui → models
+commands → planning
 commands → services
 commands → persistence
 commands → models
+planning → services
+planning → persistence
+planning → models
 services → persistence
 services → models
 services → external adapters
@@ -193,6 +246,7 @@ models → services
 rules → ui
 scanner → metadata editor UI
 duplicate service → conversion UI
+external adapters → ui
 ```
 
 ## 5.3 Rule of Thumb
@@ -212,12 +266,14 @@ src/
 └── alchemist/
     ├── app/
     ├── commands/
-    ├── core/
+    ├── domain/
+    ├── external/
+    ├── jobs/
     ├── models/
     ├── persistence/
-    ├── services/
+    ├── planning/
     ├── rules/
-    ├── jobs/
+    ├── services/
     ├── ui/
     └── utils/
 ```
@@ -233,6 +289,14 @@ sample_data/
 scripts/
 ```
 
+`domain/` contains pure domain concepts and logic.
+
+`external/` contains adapters for systems outside Alchemist.
+
+`planning/` contains Execution Plan, Decision Gate, execution, and Operation Record concepts.
+
+`utils/` must remain generic and must not become a business-logic dumping ground.
+
 ---
 
 # 7. Core Domain Concepts
@@ -245,56 +309,88 @@ It may be:
 
 - A single-file book.
 - A folder book made from multiple audio files.
+- A multi-part book made from multiple audio files.
 
-A Book has an internal UUID assigned by Alchemist.
+A Book has an `ALCHEMIST_ID` assigned by Alchemist.
 
-The UUID is stored in SQLite on discovery.
+The ID is stored internally on discovery.
 
-The UUID may be embedded into metadata only after the user performs an explicit save.
+The ID is embedded into file metadata only after the user performs an explicit metadata write.
 
 ## 7.2 Track
 
 A Track represents an audio file that belongs to a Book.
 
-Folder books have multiple tracks.
+Folder books and multi-part books have multiple Tracks.
 
-Single-file books may have one track record.
+Single-file books may have one Track record.
+
+Tracks belonging to multi-track Books have `ALCHEMIST_TRACK_ID` values.
+
+Single-file books do not require embedded `ALCHEMIST_TRACK_ID` values.
 
 ## 7.3 Canonical Metadata
 
-Alchemist uses a canonical metadata schema internally.
+Alchemist uses a canonical metadata model internally.
 
-The canonical schema is stable.
+Canonical metadata is divided into:
+
+- Canonical Business Metadata (CBM)
+- Canonical Technical Metadata (CTM)
+- Canonical Application Metadata (CAM)
+
+The canonical model is stable.
 
 Users may configure aliases and preferred write tags, but not canonical field names.
 
+The complete canonical field list is defined in `4000-metadata.md` rather than duplicated here.
+
 ## 7.4 Execution Plan
 
-An Execution Plan describes what a command intends to do before it does it.
+An Execution Plan describes approved or proposed work before it happens.
 
-Execution Plans should be human-readable and machine-recordable.
+Execution Plans are human-readable, machine-recordable, serializable, testable, and executable.
 
 They are required for:
 
+- Metadata writes.
 - Conversion.
 - Replacement.
+- Move/copy/delete operations.
 - Destructive library operations.
 - Batch operations.
+- Operations that call external systems and change state.
 
-## 7.5 Operation Record
+Simple read-only operations do not require Execution Plans.
 
-An Operation Record is a persistent record of what happened.
+## 7.5 Decision Gate
+
+A Decision Gate is a point inside an Execution Plan where human judgment or explicit policy is required before execution can continue.
+
+Examples:
+
+- Selecting one metadata match from several candidates.
+- Confirming a risky metadata change.
+- Choosing how to handle a duplicate.
+- Confirming replacement after validation warnings.
+
+## 7.6 Operation Record
+
+An Operation Record is the historical record of an executed Execution Plan.
 
 It includes:
 
+- The approved Execution Plan.
 - Operation type.
 - Inputs.
-- Execution plan.
 - Steps performed.
+- User decisions.
 - Logs.
 - Result.
 - Error state, if any.
 - Recovery state, if applicable.
+
+Operation Records provide traceability rather than merely logging events.
 
 ---
 
@@ -302,23 +398,40 @@ It includes:
 
 ## 8.1 Command Pattern
 
-Commands represent user intent.
+Commands represent user intent and generate Execution Plans.
 
-Each command should support the following conceptual flow:
+Conceptual flow:
 
 ```text
-validate()
+receive_intent()
+validate_inputs()
+gather_context()
 build_execution_plan()
-confirm_if_needed()
-execute()
-record_result()
+return_plan_or_errors()
 ```
 
-Commands may be synchronous or asynchronous depending on operation cost.
+Commands must not directly display confirmation dialogs or execute workflow steps.
 
-Long-running commands must report progress.
+## 8.2 Execution Plan Pattern
 
-## 8.2 Service Pattern
+Execution Plans represent proposed work.
+
+Conceptual flow:
+
+```text
+build_plan()
+validate_plan()
+present_plan()
+approve_plan()
+execute_approved_plan()
+record_operation()
+```
+
+Once approved, a plan is immutable.
+
+Execution should not recalculate materially different actions after approval. If the plan is no longer valid, execution must stop and the plan must be rebuilt.
+
+## 8.3 Service Pattern
 
 Services implement focused business capabilities.
 
@@ -326,7 +439,7 @@ A service should have one clear responsibility.
 
 Services should be easy to unit test.
 
-## 8.3 Repository Pattern
+## 8.4 Repository Pattern
 
 Database access should be isolated behind repositories.
 
@@ -341,7 +454,7 @@ Examples:
 - `AbsCacheRepository`
 - `DuplicateDecisionRepository`
 
-## 8.4 Rules Engine Pattern
+## 8.5 Rules Engine Pattern
 
 Rules evaluate metadata and workflow health.
 
@@ -364,9 +477,11 @@ ERROR
 BLOCKER
 ```
 
-## 8.5 Event / Progress Pattern
+Identity collisions are BLOCKER-level health issues.
 
-Long-running services and commands should emit progress events.
+## 8.6 Event / Progress Pattern
+
+Long-running services, jobs, and plan executions should emit progress events.
 
 Events may include:
 
@@ -376,6 +491,8 @@ Events may include:
 - Error.
 - Completed.
 - Cancelled.
+- Paused at Decision Gate.
+- Plan invalidated.
 
 The UI subscribes to these events and updates presentation state.
 
@@ -406,6 +523,9 @@ Startup should not block on expensive scans.
 Discover files/folders
 Build fingerprints
 Compare fingerprints to cache
+Read embedded Alchemist IDs when present
+Assign internal IDs for newly discovered books/tracks
+Compare metadata fingerprints to cache
 Mark unchanged books as current
 Queue new/changed books for enrichment
 Update cache
@@ -414,18 +534,22 @@ Emit row-level updates
 
 Routine scans must not re-read metadata for unchanged books.
 
+Scanning must not write metadata to user files.
+
 ## 9.3 Metadata Save Flow
 
 ```text
 User edits metadata
 User clicks Save
-Command validates metadata
-Command builds save plan
-Command writes metadata
-Command writes Alchemist UUID if first explicit save
-Command stores snapshot
-Command updates cache directly
-Command logs operation
+Command validates inputs
+Command builds metadata save plan
+UI presents plan / warnings when required
+User approves plan
+Execution layer writes metadata
+Execution layer writes Alchemist IDs if first explicit save
+Execution layer stores snapshot
+Execution layer updates cache directly
+Execution layer records operation
 ```
 
 Saving one book must not trigger a full incoming scan.
@@ -434,13 +558,15 @@ Saving one book must not trigger a full incoming scan.
 
 ```text
 User requests duplicate check
+Command builds duplicate check plan
 If ABS cache refreshing:
-    Wait dialog is shown
+    Decision/wait state is shown
 If ABS cache ready:
     Duplicate indexes are queried
 Results are shown
 User makes resolution decision
 Decision is persisted
+Operation record is updated
 ```
 
 ## 9.5 Conversion Flow
@@ -448,11 +574,12 @@ Decision is persisted
 ```text
 Validate book readiness
 Build conversion plan
-Show execution plan
+Show Execution Plan
+Approve plan
 Convert to staging
 Verify output
 Move to converted
-Log result
+Record operation
 ```
 
 Conversion must not write directly into the ABS library.
@@ -463,6 +590,9 @@ Conversion must not write directly into the ABS library.
 Validate incoming replacement
 Get ABS item and library ID
 Validate current library copy
+Build replacement plan
+Show Execution Plan
+Approve plan
 Archive current library copy
 Validate archived copy
 Trigger ABS scan
@@ -492,6 +622,7 @@ Examples:
 - FFmpeg conversion.
 - ABS scan polling.
 - Replacement operations.
+- Execution Plan execution.
 
 A background job should have:
 
@@ -519,40 +650,53 @@ Every expensive operation should have a cache and invalidation strategy.
 | Chapter extraction | Chapter cache | Fingerprint changed |
 | ABS library data | ABS cache | Manual refresh, stale cache, startup refresh |
 | Duplicate lookups | In-memory indexes | ABS cache rebuilt |
-| Execution plans | Operation records | New operation |
+| Execution plans | Operation records | New operation or plan invalidation |
 
 ---
 
 # 12. Identity Strategy
 
-Natural keys are not stable enough to identify books.
+Natural keys are not stable enough to identify Books.
 
-Alchemist assigns an internal UUID when a book is first discovered.
+Alchemist assigns an `ALCHEMIST_ID` when a Book is first discovered.
 
-The UUID is stored in SQLite.
+The ID is stored internally immediately.
 
-On first explicit metadata save, the UUID may be embedded into the audio metadata using:
+The ID is written to audio metadata only during an explicit user-approved metadata write.
 
-```text
-TXXX:ALCHEMIST_ID
-```
+Multi-track Books also receive `ALCHEMIST_TRACK_ID` values for each Track.
 
-For folder books, the UUID may be written to each track.
+For multi-track Books, the first approved metadata save writes:
 
-The UUID should not be embedded during background scanning.
+- the shared `ALCHEMIST_ID` to every Track,
+- the appropriate `ALCHEMIST_TRACK_ID` to each individual Track.
+
+Single-file Books do not require embedded `ALCHEMIST_TRACK_ID` values.
+
+The ID should not be embedded during background scanning.
 
 ### 12.1 Embedded Alchemist Metadata
 
-To maintain a stable identity across file moves and metadata changes,
-Alchemist may embed application-specific metadata into audio files.
+To maintain a stable identity across file moves and metadata changes, Alchemist may embed application-specific metadata into audio files.
 
 Current fields:
 
-- ALCHEMIST_ID
+- `ALCHEMIST_ID`
+- `ALCHEMIST_TRACK_ID`
 
 Future application metadata should use the `ALCHEMIST_*` namespace to avoid collisions with third-party tags.
 
 Application metadata is never used by Audiobookshelf and should not affect library organization or duplicate detection outside Alchemist.
+
+### 12.2 Identity Health
+
+Duplicate embedded `ALCHEMIST_ID` values are identity collisions.
+
+Identity collisions are BLOCKER-level metadata health issues.
+
+Malformed embedded Alchemist IDs are metadata health issues.
+
+Alchemist must not silently resolve identity collisions or invalid application identifiers.
 
 ---
 
@@ -560,32 +704,27 @@ Application metadata is never used by Audiobookshelf and should not affect libra
 
 Alchemist must use a canonical internal metadata model.
 
-The canonical business metadata model currently consists of the following fields.
+The canonical model is divided into:
 
-- album
-- title
-- subtitle
-- author
-- narrator
-- series
-- series-part
-- asin
-- isbn
-- publisher
-- published_year
-- description
-- language
-- genres
-- explicit
-- dramatic_audio
-- target_bitrate
-- target_channels
+- Canonical Business Metadata (CBM)
+- Canonical Technical Metadata (CTM)
+- Canonical Application Metadata (CAM)
+
+External metadata formats are not canonical.
+
+Alias Resolution maps external tags, fields, sidecar files, filenames, folder structures, and provider data into canonical metadata.
+
+Canonical values should preserve provenance describing where they came from and what transformations were applied.
+
+Derived values produced by cleanup or normalization must remain explainable.
 
 Tag aliases are configurable.
 
 Canonical field names are not configurable.
 
-When saving metadata, Alchemist writes preferred canonical tags while preserving legacy alias tags unless a later cleanup feature explicitly changes that behavior.
+The complete canonical field list and tag mappings belong in `4000-metadata.md`.
+
+When saving metadata, Alchemist writes preferred compatible tags while preserving existing alias tags unless an explicit cleanup feature changes that behavior through an approved Execution Plan.
 
 ---
 
@@ -595,6 +734,8 @@ Audiobookshelf integration serves two roles:
 
 1. Metadata and duplicate cache.
 2. Library control operations.
+
+ABS compatibility is a primary design objective, but ABS does not define Alchemist's internal metadata architecture.
 
 ABS metadata cache should prefer `metadata.json` by default.
 
@@ -637,7 +778,7 @@ libfdk_aac if available
 aac otherwise
 ```
 
-FFmpeg commands should be logged as part of operation records.
+FFmpeg commands should be logged as part of Operation Records.
 
 ---
 
@@ -654,12 +795,15 @@ Example tokens:
 ```text
 %author%
 %series%
+%series-part%
 %series_part%
 %album%
 %title%
 %track%
 %asin%
 ```
+
+Template tokens are user-facing aliases and may differ from canonical field names when needed for readability or filename safety.
 
 If `%track%` is an integer, it should be padded to two digits.
 
@@ -686,24 +830,29 @@ Do not silently ignore exceptions.
 
 Do not continue destructive workflows after a failed validation step.
 
+Do not continue executing an approved plan after the environment changes in a way that invalidates it.
+
 ---
 
 # 18. Logging and Operation History
 
-Every significant operation should produce an operation record.
+Every significant operation should produce an Operation Record.
 
-Operation records should include:
+Operation Records should include:
 
 - Operation type.
 - Start time.
 - End time.
 - Status.
-- Execution plan.
+- Approved Execution Plan.
 - Step log.
+- User decisions.
 - Errors.
 - Recovery options.
 
 Logs should be useful for debugging without requiring reproduction.
+
+Operation Records are historical records of executed plans, not merely text logs.
 
 ---
 
@@ -714,12 +863,14 @@ Core logic must be testable without launching the GUI.
 Testing should prioritize:
 
 - Metadata alias resolution.
+- Metadata provenance.
 - Scanner fingerprinting.
 - Incremental scan behavior.
 - Rules engine results.
 - Placement template resolution.
 - Duplicate matching.
-- Execution plan generation.
+- Execution Plan generation.
+- Plan invalidation.
 - Error recovery paths.
 - FFmpeg command construction.
 
@@ -765,6 +916,8 @@ Alchemist intentionally avoids:
 - Mutable natural keys for identity.
 - Business logic hidden inside Qt callbacks.
 - Unlogged destructive operations.
+- Commands executing workflows directly.
+- Treating ABS metadata as Alchemist's internal metadata model.
 
 ---
 
@@ -797,6 +950,7 @@ The following items may require later ADRs or subsystem decisions:
 - Whether to support YAML-driven sample corpus generation.
 - How much operation rollback should be automatic versus user-triggered.
 - Whether to support plugin-style metadata providers in the future.
+- Exact pipeline automation model.
 
 ---
 
@@ -805,19 +959,22 @@ The following items may require later ADRs or subsystem decisions:
 A feature is architecturally compliant if:
 
 - UI does not contain business logic.
-- File and external operations are performed through services.
+- File and external operations are performed through services or external adapters.
 - Significant actions are command-driven.
+- Commands generate Execution Plans rather than executing workflows directly.
+- Significant state-changing operations produce Execution Plans.
+- Approved plans are not silently changed during execution.
 - Expensive operations use caching where practical.
 - Destructive operations have validation and confirmation.
 - Operation history is recorded.
 - Core logic is unit-testable.
-- The feature follows the design principles and AGENTS.md.
+- The feature follows the design principles, ADRs, and AGENTS.md.
 
 ---
 
 # 25. Summary
 
-Alchemist is designed as a cautious, explainable, maintainable audiobook management system.
+Alchemist is designed as a cautious, explainable, maintainable audiobook workflow system.
 
 The architecture exists to protect user data, reduce cognitive load, improve performance, and make future development easier.
 
