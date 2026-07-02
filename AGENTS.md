@@ -4,7 +4,7 @@
 
 ## Project Mission
 
-Alchemist is a cross-platform audiobook metadata management application.
+Alchemist is a cross-platform audiobook workflow application for metadata management, duplicate detection, conversion, and Audiobookshelf library operations.
 
 It is **not** simply a metadata editor.
 
@@ -22,25 +22,43 @@ Alchemist is intended to be software that its author is proud to maintain five y
 
 ---
 
+# Governing Documentation
+
+Implementation work must remain consistent with:
+
+- `docs/adr/`
+- `docs/architecture/1000-system-architecture/1000-system-architecture.md`
+- relevant subsystem specifications under `docs/architecture/`
+
+When documentation conflicts, prefer the accepted ADRs and raise the conflict rather than guessing.
+
+---
+
 # Architectural Philosophy
 
 This project follows a layered architecture.
 
-```
+```text
 UI
  ↓
 Commands
+ ↓
+Execution Plans
  ↓
 Services
  ↓
 Persistence / External Systems
 ```
 
-The UI is responsible only for presentation.
+The UI is responsible only for presentation and user interaction.
 
-Business logic belongs in services.
+Commands translate user intent into Execution Plans.
 
-Operations are coordinated through commands.
+Execution Plans are the executable artifacts.
+
+Services implement focused business capabilities.
+
+Operation Records preserve the history of executed plans.
 
 ---
 
@@ -73,12 +91,14 @@ Background scans must never modify files.
 Significant operations must support:
 
 - validation
-- execution planning
-- confirmation
-- execution
-- logging
+- Execution Plan generation
+- approval when required
+- plan execution
+- Operation Record creation
 
 Do not perform destructive operations directly from UI events.
+
+Do not execute a materially different plan than the user approved.
 
 ---
 
@@ -86,13 +106,11 @@ Do not perform destructive operations directly from UI events.
 
 Whenever practical:
 
-Archive first.
-
-Validate.
-
-Execute.
-
-Verify.
+- Archive first.
+- Validate.
+- Execute.
+- Verify.
+- Record what happened.
 
 Never delete data simply because it is convenient.
 
@@ -106,7 +124,9 @@ If Alchemist performs an operation, the user should be able to understand:
 - what
 - how
 
-Execution Plans are first-class features.
+Execution Plans are first-class architectural objects.
+
+Operation Records should explain what actually happened.
 
 ---
 
@@ -121,6 +141,8 @@ Responsible for:
 - presentation
 - progress
 - user interaction
+- plan display
+- Decision Gate interaction
 
 Must NOT:
 
@@ -129,32 +151,50 @@ Must NOT:
 - call ABS directly
 - perform duplicate detection
 - execute filesystem operations
+- orchestrate service workflows directly
 
 ---
 
 ## Commands
 
-Commands coordinate workflows.
+Commands generate Execution Plans.
 
 Examples:
 
-SaveMetadataCommand
-
-ConvertBookCommand
-
-ReplaceLibraryItemCommand
-
-CheckDuplicatesCommand
+- `SaveMetadataCommand`
+- `ConvertBookCommand`
+- `ReplaceLibraryItemCommand`
+- `CheckDuplicatesCommand`
 
 Every command should support:
 
-validate()
+- `validate_inputs()`
+- `gather_context()`
+- `build_execution_plan()`
+- `return_plan_or_errors()`
 
-build_execution_plan()
+Commands must not directly execute workflow steps.
 
-execute()
+---
 
-describe()
+## Execution Plans
+
+Execution Plans describe proposed work before it happens.
+
+Plans should describe:
+
+- purpose
+- inputs
+- expected outputs
+- steps
+- warnings
+- risks
+- approval requirements
+- recovery options
+
+Approved plans are immutable.
+
+If the environment changes in a way that affects the outcome, invalidate the plan and rebuild it.
 
 ---
 
@@ -164,15 +204,11 @@ Services implement business logic.
 
 Examples:
 
-Scanner
-
-MetadataService
-
-FFmpegManager
-
-ABSManager
-
-PlacementEngine
+- `Scanner`
+- `MetadataService`
+- `FFmpegManager`
+- `ABSManager`
+- `PlacementEngine`
 
 Services should not know about Qt widgets.
 
@@ -182,13 +218,10 @@ Services should not know about Qt widgets.
 
 SQLite stores:
 
-settings
-
-cache
-
-history
-
-indexes
+- settings
+- cache
+- history
+- indexes
 
 Never store cover-art blobs.
 
@@ -202,7 +235,27 @@ Never expose tag implementation details to higher layers.
 
 Aliases are configurable.
 
-Canonical names are NOT.
+Canonical names are not configurable.
+
+Canonical metadata is divided into:
+
+- Canonical Business Metadata (CBM)
+- Canonical Technical Metadata (CTM)
+- Canonical Application Metadata (CAM)
+
+Resolved canonical values should preserve provenance whenever practical.
+
+---
+
+# Identity
+
+Books have `ALCHEMIST_ID` values.
+
+Multi-track books have `ALCHEMIST_TRACK_ID` values for each track.
+
+Application identifiers are assigned internally on discovery but are embedded only during explicit user-approved metadata writes.
+
+ASIN, ISBN, filenames, folder names, and paths are matching signals, not primary identity.
 
 ---
 
@@ -215,6 +268,8 @@ Never rescan the entire library after routine edits.
 Use cache invalidation.
 
 Prefer updating a single book over rebuilding everything.
+
+Scanning must not write metadata to user files.
 
 ---
 
@@ -258,9 +313,7 @@ Surface actionable errors.
 
 Operations should fail gracefully.
 
-Whenever possible:
-
-leave user data untouched.
+Whenever possible, leave user data untouched.
 
 ---
 
@@ -272,13 +325,12 @@ Important events should be logged.
 
 Logs should explain:
 
-what happened
+- what happened
+- why
+- duration
+- result
 
-why
-
-duration
-
-result
+Operation Records are the historical records of executed plans, not just text logs.
 
 ---
 
@@ -289,6 +341,8 @@ Prefer confirmation over surprise.
 Prefer information over assumptions.
 
 Users should understand what the software is doing.
+
+Friction should be intentional and functional.
 
 ---
 
@@ -324,21 +378,20 @@ No UI directly calling ABS.
 
 No mutable natural keys.
 
+No commands directly executing workflows.
+
 ---
 
 # Lessons Learned
 
 FletchAudio demonstrated that:
 
-UI responsiveness must never depend on filesystem scans.
-
-Metadata should be canonicalized.
-
-Execution plans reduce mistakes.
-
-Incremental scanning scales.
-
-Architecture should be designed before implementation.
+- UI responsiveness must never depend on filesystem scans.
+- Metadata should be canonicalized.
+- Execution Plans reduce mistakes.
+- Incremental scanning scales.
+- Architecture should be designed before implementation.
+- Users should not be forced outside the application for normal audiobook workflows.
 
 ---
 
@@ -362,7 +415,9 @@ Architecture is long-lived.
 
 1. Prefer obvious code over clever code.
 2. If you touch a module and can make a small improvement without expanding scope, do so.
+
 Examples:
+
 - Better type hints
 - Clearer variable names
 - Remove dead code
@@ -376,5 +431,3 @@ Examples:
 1. Do not patch around bugs.
 2. Identify the architectural cause whenever possible.
 3. If a workaround is necessary, document why.
-
-
